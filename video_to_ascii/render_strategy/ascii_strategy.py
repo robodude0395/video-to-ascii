@@ -6,7 +6,8 @@ import time
 import sys
 import os
 import cv2
-import tempfile 
+import tempfile
+import threading
 
 PLATFORM = 0
 if sys.platform != 'win32':
@@ -100,16 +101,28 @@ class AsciiStrategy(re.RenderStrategy):
             temp_dir = tempfile.gettempdir()
             temp_file_path = temp_dir + "/temp-audiofile-for-vta.wav"
             wave_file = wave.open(temp_file_path, 'rb')
-            chunk = int(wave_file.getframerate() / fps)
             p = pyaudio.PyAudio()
 
-            stream = p.open(format =
-                p.get_format_from_width(wave_file.getsampwidth()),
-                channels = wave_file.getnchannels(),
-                rate = wave_file.getframerate(),
-                output = True)
-                       
-            data = wave_file.readframes(chunk)
+            # Use a larger buffer (4096 frames) for smoother playback
+            audio_chunk = 4096
+            audio_finished = threading.Event()
+
+            def audio_callback(in_data, frame_count, time_info, status):
+                data = wave_file.readframes(frame_count)
+                if len(data) == 0:
+                    audio_finished.set()
+                    return (data, pyaudio.paComplete)
+                return (data, pyaudio.paContinue)
+
+            audio_stream = p.open(
+                format=p.get_format_from_width(wave_file.getsampwidth()),
+                channels=wave_file.getnchannels(),
+                rate=wave_file.getframerate(),
+                output=True,
+                frames_per_buffer=audio_chunk,
+                stream_callback=audio_callback
+            )
+            audio_stream.start_stream()
             
 
         if output is not None:
@@ -122,13 +135,13 @@ class AsciiStrategy(re.RenderStrategy):
 
         time_delta = 1./fps
         counter=0
+        playback_start = time.time()
         if PLATFORM:
             sys.stdout.write("echo -en '\033[2J' \n")
         else:
             sys.stdout.write('\033[2J')
         # read each frame
         while cap.isOpened():
-            t0 = time.process_time()
             if PLATFORM:
                 rows, cols = os.popen('stty size', 'r').read().split()
             else:
@@ -136,11 +149,20 @@ class AsciiStrategy(re.RenderStrategy):
             _ret, frame = cap.read()
             if frame is None:
                 break
-            if with_audio:
-                data = wave_file.readframes(chunk)
-                stream.write(data)
+            if with_audio and audio_finished.is_set():
+                break
+
+            # Calculate the expected presentation time for this frame
+            expected_time = counter * time_delta
+            elapsed = time.time() - playback_start
+
             # sleep if the process was too fast
             if output is None:
+                # Skip frames if video is behind audio
+                if with_audio and elapsed > expected_time + time_delta:
+                    counter += 1
+                    continue
+
                 if PLATFORM:
                     sys.stdout.write('\u001b[0;0H')
                 else:
@@ -148,11 +170,11 @@ class AsciiStrategy(re.RenderStrategy):
                 # scale each frame according to terminal dimensions
                 resized_frame = self.resize_frame(frame, (cols, rows))
                 # convert frame pixels to colored string
-                msg = self.convert_frame_pixels_to_ascii(resized_frame, (cols, rows)) 
-                t1 = time.process_time()
-                delta = time_delta - (t1 - t0)
-                if delta > 0:
-                    time.sleep(delta)
+                msg = self.convert_frame_pixels_to_ascii(resized_frame, (cols, rows))
+                # Wait until it's time to show this frame
+                wait_time = expected_time - (time.time() - playback_start)
+                if wait_time > 0:
+                    time.sleep(wait_time)
                 sys.stdout.write(msg) # Print the final string
             else:
                 print(self.build_progress(counter, length))
@@ -183,7 +205,9 @@ class AsciiStrategy(re.RenderStrategy):
 
             counter += 1
         if with_audio:
-            stream.close()
+            audio_stream.stop_stream()
+            audio_stream.close()
+            wave_file.close()
             p.terminate()
         if PLATFORM:
             sys.stdout.write("echo -en '\033[2J' \n")
